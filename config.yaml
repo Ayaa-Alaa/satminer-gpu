@@ -1,35 +1,13 @@
 # ============================================================
-# SAT Miner — Salad Cloud GPU Config
+# SAT Miner — Salad Cloud GPU Config (VPS approach)
+# Private key passed via PRIVATE_KEY env var, NOT stored here
 # ============================================================
 
-private_key: "0xfcc61a25fe0177d4e68b56a3c3117690b602114a2fd381056cd5c0a1ea5273a0"
-
-# SAT Contract / BSC Mainnet
+# --- SAT Contract / BSC Mainnet ---
 contract_address: "0x14Dc4b4929c664534f1d4D64107d8F36CbF906a0"
 chain_id: 56
 
-# --- Gas ---
-use_network_gas: true
-network_gas_multiplier: 1.0
-min_gas_price_gwei: 0.01
-max_gas_price_gwei: 5
-gas_price_gwei: 0.05
-gas_limit: 200000
-
-# --- Solver (CUDA via numba) ---
-solver: gpu
-gpu_device: "NVIDIA"
-gpu_util: 100
-gpu_batch_size: 16000000
-
-# --- Relay URLs ---
-relay_urls:
-  - "https://bsc.rpc.blxrbdn.com"
-  - "https://rpc-bsc.48.club"
-  - "https://0.48.club"
-
 # --- RPC (load balanced, tested live) ---
-rpc_url: "https://bsc-dataseed1.binance.org/"
 rpc_urls:
   - "https://bsc-dataseed.binance.org/"
   - "https://bsc-dataseed1.binance.org/"
@@ -43,16 +21,46 @@ rpc_urls:
   - "https://1rpc.io/bnb"
   - "https://bsc-mainnet.public.blastapi.io"
 
-# --- WebSocket ---
-ws_urls:
-  - "wss://bsc-rpc.publicnode.com"
-detect_mode: auto
-head_ws: "wss://bsc-rpc.publicnode.com"
+# --- Solver: GPU ---
+gpu_device: "NVIDIA"
+gpu_util: 100
+gpu_batch_size: 16000000
 
-# --- Options ---
-dry_run: false
-verbose_logs: false
+# --- Gas ---
+use_network_gas: true
+network_gas_multiplier: 1.0
+min_gas_price_gwei: 0.05
+max_gas_price_gwei: 5
+gas_price_gwei: 0.1
+gas_limit: 200000
+
+# --- Submission ---
+wait_for_receipt: false
 simulate_before_submit: true
+simulate_gas_threshold_gwei: 0.1
+recheck_challenge_before_send: true
+one_submit_per_challenge: true
+
+# --- Challenge detection ---
+challenge_check_secs: 6
+target_refresh_secs: 60
+
+# --- Dry run: SET TO false AFTER TESTING ---
+dry_run: false
+
+# --- Logging ---
+auto_restart: true
+quiet_logs: true
+log_interval: 10
+stats_interval_secs: 10
 receipt_poll_secs: 3
 receipt_timeout_secs: 180
-stats_interval_secs: 30
+
+# --- Nonce healing ---
+nonce_stuck_threshold: 5
+nonce_heal_cooldown_secs: 30
+nonce_bump_multiplier: 1.5
+
+# --- Gas gate ---
+mine_only_below_gwei: 0
+gas_recheck_secs: 15
