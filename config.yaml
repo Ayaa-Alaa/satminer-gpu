@@ -28,17 +28,24 @@ relay_urls:
   - "https://rpc-bsc.48.club"
   - "https://0.48.club"
 
-# --- RPC ---
-rpc_url: "https://bsc-dataseed1.binance.org"
+# --- RPC (load balanced, tested live) ---
+rpc_url: "https://bsc-dataseed1.binance.org/"
 rpc_urls:
-  - "https://bsc-dataseed1.binance.org"
-  - "https://bsc-dataseed2.binance.org"
-  - "https://bsc-dataseed3.binance.org"
-  - "https://bsc-dataseed4.binance.org"
+  - "https://bsc-dataseed.binance.org/"
+  - "https://bsc-dataseed1.binance.org/"
+  - "https://bsc-dataseed2.binance.org/"
+  - "https://bsc-dataseed3.binance.org/"
+  - "https://bsc-dataseed4.binance.org/"
+  - "https://bsc-dataseed1.defibit.io/"
+  - "https://bsc-dataseed2.defibit.io/"
+  - "https://bsc-dataseed1.ninicoin.io/"
+  - "https://bsc.publicnode.com"
+  - "https://1rpc.io/bnb"
+  - "https://bsc-mainnet.public.blastapi.io"
 
 # --- WebSocket ---
 ws_urls:
-  - "wss://bsc.drpc.org"
+  - "wss://bsc-rpc.publicnode.com"
 detect_mode: auto
 head_ws: "wss://bsc-rpc.publicnode.com"
 
