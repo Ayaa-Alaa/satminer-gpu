@@ -26,7 +26,6 @@ import random
 import signal
 import threading
 
-import numpy as np
 import yaml
 from web3 import Web3
 
@@ -166,189 +165,31 @@ __kernel void mine(__global const uchar* prefix52,   // 52 字节: challenge(32)
 }
 """
 
-# ─── CUDA 求解器 (using numba) ───────────────────────────────────────────────
-
-CUDA_RC = np.array([
-    0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
-    0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-    0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
-    0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
-    0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
-    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
-], dtype=np.uint64)
-
-CUDA_ROTC = np.array([
-    1,  3,  6,  10, 15, 21, 28, 36, 45, 55, 2,  14,
-    27, 41, 56, 8,  25, 43, 62, 18, 39, 61, 20, 44
-], dtype=np.int32)
-
-CUDA_PILN = np.array([
-    10, 7,  11, 17, 18, 3,  5,  16, 8,  21, 24, 4,
-    15, 23, 19, 13, 12, 2,  20, 14, 22, 9,  6,  1
-], dtype=np.int32)
-
-_HAS_CUDA = False
-try:
-    from numba import cuda, uint64, uint8, int32
-    _HAS_CUDA = cuda.is_available()
-except Exception:
-    pass
-
-if _HAS_CUDA:
-    @cuda.jit(device=True)
-    def _cuda_keccakf(st):
-        bc = cuda.local.array(5, dtype=uint64)
-        for r in range(24):
-            for i in range(5):
-                bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20]
-            for i in range(5):
-                t = bc[(i + 4) % 5] ^ ((bc[(i + 1) % 5] << uint64(1)) | (bc[(i + 1) % 5] >> uint64(63)))
-                for j in range(0, 25, 5):
-                    st[j + i] ^= t
-            t = st[1]
-            for i in range(24):
-                j = CUDA_PILN[i]
-                bc[0] = st[j]
-                st[j] = ((t << CUDA_ROTC[i]) | (t >> (uint64(64) - CUDA_ROTC[i])))
-                t = bc[0]
-            for j in range(0, 25, 5):
-                for i in range(5):
-                    bc[i] = st[j + i]
-                for i in range(5):
-                    st[j + i] ^= (~bc[(i + 1) % 5]) & bc[(i + 2) % 5]
-            st[0] ^= CUDA_RC[r]
-
-    @cuda.jit
-    def _cuda_mine_kernel(prefix, target, start_nonce, result, total_nonces, npt):
-        tid = cuda.grid(1)
-        stride = cuda.gridsize(1)
-        base = start_nonce + uint64(tid * npt)
-
-        for n_offset in range(npt):
-            nonce = base + uint64(n_offset)
-            if nonce >= start_nonce + uint64(total_nonces):
-                return
-
-            if result[0] != 0:
-                return
-
-            b = cuda.local.array(136, dtype=uint8)
-            for i in range(136):
-                b[i] = uint8(0)
-            for i in range(52):
-                b[i] = prefix[i]
-            for i in range(8):
-                b[83 - i] = uint8((nonce >> (8 * i)) & uint64(0xff))
-            b[84] = uint8(0x01)
-            b[135] = uint8(0x80)
-
-            st = cuda.local.array(25, dtype=uint64)
-            for i in range(25):
-                st[i] = uint64(0)
-
-            for j in range(17):
-                lane = uint64(0)
-                for k in range(8):
-                    lane |= uint64(b[j * 8 + k]) << (8 * k)
-                st[j] ^= lane
-
-            _cuda_keccakf(st)
-
-            for i in range(32):
-                lane_idx = i // 8
-                byte_idx = i % 8
-                dbyte = uint8((st[lane_idx] >> (8 * byte_idx)) & uint64(0xff))
-                tbyte = target[i]
-                if dbyte < tbyte:
-                    result[0] = nonce
-                    return
-                elif dbyte > tbyte:
-                    break
-
-
-    class CudaMiner:
-        """GPU 求解器 (CUDA via numba). Persistent buffers, multi-nonce per thread."""
-        def __init__(self, cfg):
-            self.batch_size = int(cfg.get("gpu_batch_size", 64_000_000))
-            util = float(cfg.get("gpu_target_util", cfg.get("gpu_util", 100)))
-            self.target_util = min(100.0, max(1.0, util))
-            try:
-                self.device = cuda.get_current_device()
-                self.device_name = self.device.name.decode() if isinstance(self.device.name, bytes) else str(self.device.name)
-            except Exception:
-                self.device_name = "NVIDIA GPU (CUDA)"
-
-            self._tpb = 512
-            self._npt = 8
-            self._d_prefix = cuda.device_array(52, dtype=np.uint8)
-            self._d_target = cuda.device_array(32, dtype=np.uint8)
-            self._d_result = cuda.device_array(1, dtype=np.uint64)
-            self._zero_arr = np.zeros(1, dtype=np.uint64)
-            self._last_prefix = None
-            self._last_target = None
-
-        def search(self, prefix52, target32, start_nonce, count):
-            total_threads = (count + self._npt - 1) // self._npt
-            if total_threads < self._tpb:
-                total_threads = self._tpb
-            blocks = (total_threads + self._tpb - 1) // self._tpb
-
-            if prefix52 is not self._last_prefix:
-                self._d_prefix.copy_to_device(np.frombuffer(prefix52, dtype=np.uint8))
-                self._last_prefix = prefix52
-            if target32 is not self._last_target:
-                self._d_target.copy_to_device(np.frombuffer(target32, dtype=np.uint8))
-                self._last_target = target32
-
-            self._d_result.copy_to_device(self._zero_arr)
-
-            t0 = time.time()
-            _cuda_mine_kernel[blocks, self._tpb](
-                self._d_prefix, self._d_target, uint64(start_nonce),
-                self._d_result, int32(count), int32(self._npt))
-            cuda.synchronize()
-            t_batch = time.time() - t0
-
-            if self.target_util < 100.0:
-                sleep_s = t_batch * (100.0 - self.target_util) / self.target_util
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-
-            result_arr = self._d_result.copy_to_host()
-            result = int(result_arr[0])
-            return None if result == 0 else result
-else:
-    class CudaMiner:
-        def __init__(self, cfg):
-            raise ImportError("numba.cuda not available")
-
-
-# ─── OpenCL 求解器 (fallback) ────────────────────────────────────────────────
 
 class GpuMiner:
     def __init__(self, cfg):
-        self._use_cuda = False
-        if _HAS_CUDA:
-            try:
-                self._impl = CudaMiner(cfg)
-                self._use_cuda = True
-                self.device_name = self._impl.device_name
-                self.batch_size = self._impl.batch_size
-                self.target_util = self._impl.target_util
-                return
-            except Exception:
-                pass
         import pyopencl as cl
-        import numpy as _np
-        self._impl = None
-        self._cl = cl
-        self._np = _np
+        import numpy as np
+        self.cl = cl
+        self.np = np
 
         self.batch_size = int(cfg.get("gpu_batch_size", 4_000_000))
 
-        util = float(cfg.get("gpu_target_util", cfg.get("gpu_util", 100)))
+        # GPU 占空比节流 (温控):
+        #   gpu_target_util = 目标平均占用率(%), 范围 1..100.
+        #   100 = 全速不节流; 50 = 算一批歇一批(温度≈砍半); 越低越凉, 算力同比下降.
+        #   原理: 每批 search 实测耗时 t_batch, 之后 sleep = t_batch*(100-U)/U,
+        #         使 占用率 = 忙/(忙+歇) ≈ U. 不依赖预设算力, 换机器/换 batch 都自适应.
+        # 兼容两种键名: gpu_target_util (代码原用) 与 gpu_util (config.yaml 里写的)
+        util = cfg.get("gpu_target_util", cfg.get("gpu_util", 100))
+        try:
+            util = float(util)
+        except (TypeError, ValueError):
+            util = 100.0
         self.target_util = min(100.0, max(1.0, util))
 
+        # 选设备: 优先 GPU. 若配置了 gpu_device 子串 (如 "3070"/"NVIDIA"), 优先匹配它
+        # (多 OpenCL 平台/设备时避免选错, 例如核显 + 独显并存).
         want = str(cfg.get("gpu_device", "") or "").lower()
         gpus = []
         for platform in cl.get_platforms():
@@ -364,6 +205,7 @@ class GpuMiner:
         if device is None and gpus:
             device = gpus[0]
         if device is None:
+            # 退而求其次用任意设备
             device = cl.get_platforms()[0].get_devices()[0]
 
         self.device = device
@@ -371,13 +213,14 @@ class GpuMiner:
         self.queue = cl.CommandQueue(self.ctx)
         self.program = cl.Program(self.ctx, KERNEL_SRC).build()
         self.kernel = self.program.mine
+
         self.device_name = device.name.strip()
 
     def search(self, prefix52, target32, start_nonce, count):
-        if self._use_cuda:
-            return self._impl.search(prefix52, target32, start_nonce, count)
-        cl = self._cl
-        np = self._np
+        """扫描 [start_nonce, start_nonce+count) 区间.
+        返回命中的 nonce (int) 或 None."""
+        cl = self.cl
+        np = self.np
         mf = cl.mem_flags
 
         prefix_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
@@ -394,6 +237,8 @@ class GpuMiner:
         self.queue.finish()
         t_batch = time.time() - t0
 
+        # 占空比节流: 算一批后按目标占用率休眠, 把 GPU 平均占用(≈温度)锁定在 target_util.
+        # sleep = t_batch * (100 - U) / U  ->  忙/(忙+歇) = U
         if self.target_util < 100.0:
             sleep_s = t_batch * (100.0 - self.target_util) / self.target_util
             if sleep_s > 0:
@@ -418,13 +263,28 @@ def _norm_key(k):
 def load_config():
     with open(CONFIG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
+
+    # --- VPS 安全: 优先用环境变量传私钥, 避免明文写进 config.yaml ---
+    #   单钱包:  export PRIVATE_KEY=0x...
+    #   多钱包:  export PRIVATE_KEYS=0xaaa,0xbbb,0xccc
+    # 也可用环境变量覆盖 RPC:  export RPC_URLS=https://a,https://b
+    env_keys = os.environ.get("PRIVATE_KEYS")
+    env_key = os.environ.get("PRIVATE_KEY")
+    if env_keys:
+        cfg["private_keys"] = [k.strip() for k in env_keys.split(",") if k.strip()]
+    elif env_key:
+        cfg["private_keys"] = [env_key.strip()]
+    env_rpc = os.environ.get("RPC_URLS")
+    if env_rpc:
+        cfg["rpc_urls"] = [u.strip() for u in env_rpc.split(",") if u.strip()]
+
     keys = cfg.get("private_keys") or []
     if keys:
         cfg["private_keys"] = [_norm_key(k) for k in keys]
     else:
         pk = cfg.get("private_key")
         if not pk or pk == "YOUR_PRIVATE_KEY_HERE":
-            log("请先在 config.yaml 中填写 private_key 或 private_keys", "ERROR")
+            log("请先在 config.yaml 填写 private_key, 或用环境变量 PRIVATE_KEY / PRIVATE_KEYS", "ERROR")
             sys.exit(1)
         cfg["private_keys"] = [_norm_key(pk)]
     return cfg
@@ -1006,6 +866,13 @@ def mine_loop(w3, contract, accounts, cfg, gpu):
 
     n_wallets = len(accounts)
     round_num = 0
+
+    # 试运行: 算出解只打印不提交, 不花 gas. config dry_run:true 或环境变量 DRY_RUN=1.
+    # 在 VPS 上第一次跑务必先开 dry_run, 看 "找到解→耗时" 确认算力 OK 再关掉真打.
+    dry_run = bool(cfg.get("dry_run", False)) or \
+        os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
+    if dry_run:
+        log("DRY_RUN 已开启: 只算解+计时, 不提交不花 gas", "WARN")
     wallet_idx = 0   # 当前钱包指针, 只在成功 mint 后才前进
     dead = set()  # BNB 不足、已永久跳过的钱包地址
     total_hashes = 0
@@ -1221,6 +1088,11 @@ def mine_loop(w3, contract, accounts, cfg, gpu):
             vlog(f"  耗时    : {elapsed:.1f}s", "OK")
             vlog(f"  本轮算力: {fmt_hashrate(rate)}", "OK")
             vlog("*" * 55, "OK")
+
+            if dry_run:
+                log(f"[DRY_RUN] 找到解 nonce={nonce_val} 耗时 {elapsed:.2f}s "
+                    f"算力 {fmt_hashrate(rate)} (未提交, 0 gas)", "OK")
+                continue
 
             if fire:
                 # 发送前再查一次挑战号: GPU grind 期间(1~3s)若挑战号已被他人/另一进程抢先
